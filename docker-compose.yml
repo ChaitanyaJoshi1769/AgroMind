@@ -1,0 +1,200 @@
+version: "3.9"
+
+services:
+  # Database
+  postgres:
+    image: postgis/postgis:16-3.4
+    container_name: agromind-postgres
+    environment:
+      POSTGRES_USER: agromind
+      POSTGRES_PASSWORD: agromind
+      POSTGRES_DB: agromind
+      POSTGRES_INITDB_ARGS: "-c shared_preload_libraries=pg_trgm"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agromind"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agromind
+
+  # Redis
+  redis:
+    image: redis:7-alpine
+    container_name: agromind-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agromind
+
+  # Kafka
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: agromind-kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 24
+    ports:
+      - "9092:9092"
+    depends_on:
+      - zookeeper
+    networks:
+      - agromind
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: agromind-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_SYNC_LIMIT: 2
+      ZOOKEEPER_INIT_LIMIT: 5
+    ports:
+      - "2181:2181"
+    networks:
+      - agromind
+
+  # TimescaleDB
+  timescale:
+    image: timescale/timescaledb:2.13-pg16
+    container_name: agromind-timescale
+    environment:
+      POSTGRES_USER: agromind
+      POSTGRES_PASSWORD: agromind
+      POSTGRES_DB: telemetry
+    ports:
+      - "5433:5432"
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agromind"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - agromind
+
+  # Vector Database (Qdrant)
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: agromind-qdrant
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    environment:
+      QDRANT_API_KEY: "agromind-key"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - agromind
+
+  # Backend API
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: agromind-api
+    environment:
+      DEBUG: "true"
+      DATABASE_URL: postgresql+asyncpg://agromind:agromind@postgres:5432/agromind
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKERS: kafka:9092
+      TIMESCALE_URL: postgresql://agromind:agromind@timescale:5432/telemetry
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      timescale:
+        condition: service_healthy
+    volumes:
+      - ./apps/api:/app/api
+      - ./models:/app/models
+    networks:
+      - agromind
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Frontend
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: agromind-web
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+    volumes:
+      - ./apps/web:/app/web
+      - /app/web/.next
+    networks:
+      - agromind
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: agromind-prometheus
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    networks:
+      - agromind
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: agromind-grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_SECURITY_ADMIN_USER: admin
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/grafana/provisioning:/etc/grafana/provisioning
+    networks:
+      - agromind
+
+networks:
+  agromind:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  timescale_data:
+  redis_data:
+  qdrant_data:
+  prometheus_data:
+  grafana_data:
